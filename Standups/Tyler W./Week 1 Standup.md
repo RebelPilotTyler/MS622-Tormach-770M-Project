@@ -1,1 +1,5 @@
-[FIXME]
+Week 1 Standup - 7/5/2026 - Tyler W.
+
+This week, I worked on setting up some key infrastructure the group will need for the entire project. I set up the Trello board, and posted the invite link so students could be aware of where to put and store information. I also set up this GitHub repo, with a couple folders for easy future uploads and data. Finally, I also posted the GitHub repo link to the Trello board, so fellow students can join this repository as collaborators and upload files. 
+Next, I'll be probably posting the GitHub link in more places so it's easier for more students to get into, as it requires me to send invites to individual people instead of an open invite link like Trello had. I'll also be meeting with the team, likely during this coming week during/outside of class through Teams, to brainstorm our direction for the project, and update the Trello board accordingly. 
+The biggest roadblock as of right now, something I mostly foresee, is properly including fully asynchronous team members. The hope is that everyone will be able to meet during class, but communication even with those who aren't able to regularly make it to class sessions is going to be critical.
