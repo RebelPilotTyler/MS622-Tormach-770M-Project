@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CNC Access Manager · Admin</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- ============ PAGE 1: LOGIN ============ -->
+  <div id="loginView" class="login-wrap">
+    <form class="login-card" onsubmit="doLogin(event)">
+      <h1>CNC Access Manager</h1>
+      <p class="sub">Tormach 770M · Admin sign-in</p>
+      <label>Username
+        <input id="l_user" type="text" autocomplete="username" required>
+      </label>
+      <label>Password
+        <input id="l_pass" type="password" autocomplete="current-password" required>
+      </label>
+      <p id="loginError" class="login-error" hidden>Invalid username or password.</p>
+      <button type="submit" class="primary block">Sign in</button>
+      <small class="hint">Demo login — user: <code>admin</code> · pass: <code>admin</code></small>
+    </form>
+  </div>
+
+  <!-- ============ MAIN APP (hidden until login) ============ -->
+  <div id="appView" hidden>
+    <header class="app-header">
+      <div>
+        <h1>CNC Access Manager</h1>
+        <p class="sub">Tormach 770M · Access &amp; Logging System (MVP · mock data)</p>
+      </div>
+      <button class="ghost small" onclick="doLogout()">Sign out</button>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-page="users"  onclick="showPage('users')">Users</button>
+      <button class="tab"        data-page="logs"   onclick="showPage('logs')">Logs</button>
+      <button class="tab"        data-page="safety" onclick="showPage('safety')">Safety Checklist</button>
+    </nav>
+
+    <!-- ============ PAGE 2: USERS ============ -->
+    <section id="page-users" class="page">
+      <div class="toolbar">
+        <input id="search" type="text" placeholder="Search name or card…" oninput="renderUsers()">
+        <button class="primary" onclick="openForm()">＋ Add user</button>
+      </div>
+      <table id="userTable">
+        <thead>
+          <tr>
+            <th>Name</th><th>Card (RFID hex)</th><th>PIN</th>
+            <th>Level</th><th>Status</th><th class="actions">Actions</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="usersEmpty" class="empty" hidden>No matching users.</p>
+      <p id="userCount" class="count"></p>
+    </section>
+
+    <!-- ============ PAGE 4: LOGS ============ -->
+    <section id="page-logs" class="page" hidden>
+      <h2 class="page-title">Access log</h2>
+      <p class="page-note">Who signed in to the machine and when.</p>
+      <table id="accessTable">
+        <thead>
+          <tr><th>User</th><th>Signed in</th><th>Signed out</th><th>Duration</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+
+      <h2 class="page-title" style="margin-top:28px">Event log</h2>
+      <p class="page-note">Crashes, dull/broken bits, and clean sign-offs — this is the accountability trail.</p>
+      <table id="eventTable">
+        <thead>
+          <tr><th>User</th><th>Type</th><th>Note</th><th>Time</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- ============ PAGE 5: SAFETY CHECKLIST ============ -->
+    <section id="page-safety" class="page" hidden>
+      <h2 class="page-title">Pre-start safety checklist</h2>
+      <p class="page-note">Every <span class="req">required</span> item must be checked before the machine will unlock.</p>
+      <ul id="checklist" class="checklist"></ul>
+
+      <div id="gate" class="gate locked">
+        <span id="gateText">Start locked — complete all required items</span>
+      </div>
+      <button class="ghost small" onclick="resetChecklist()">Reset checklist</button>
+    </section>
+
+    <!-- ============ PAGE 3: ADD / EDIT USER (modal) ============ -->
+    <div id="overlay" class="overlay" hidden>
+      <div class="modal">
+        <h2 id="formTitle">Add user</h2>
+        <form id="userForm" onsubmit="saveUser(event)">
+          <label>Name
+            <input id="f_name" type="text" required>
+          </label>
+          <label>Card (RFID hex)
+            <div class="scan-row">
+              <input id="f_rfid" type="text" placeholder="e.g. A1B2C3D4" required
+                     pattern="[0-9A-Fa-f]{8}([0-9A-Fa-f]{6})?">
+              <button type="button" class="ghost" onclick="mockScan()">Scan</button>
+            </div>
+            <small>When the reader is connected, this fills in automatically.</small>
+          </label>
+          <label>PIN (4 digits)
+            <input id="f_pin" type="text" inputmode="numeric" pattern="\d{4}" maxlength="4" required>
+          </label>
+          <label>Certification level
+            <select id="f_level">
+              <option value="A">A (full access)</option>
+              <option value="B">B (needs walk-through)</option>
+              <option value="none">none (not certified)</option>
+            </select>
+          </label>
+          <label>Status
+            <select id="f_status">
+              <option value="active">active</option>
+              <option value="disabled">disabled</option>
+            </select>
+          </label>
+          <div class="modal-actions">
+            <button type="button" class="ghost" onclick="closeForm()">Cancel</button>
+            <button type="submit" class="primary">Save</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <footer>
+      <span class="note">Connected to SQLite (<code>cnc.db</code>) via <code>server.py</code>. Every change is written to the database and syncs for anyone on this server.</span>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
