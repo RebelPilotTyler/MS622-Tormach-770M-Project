@@ -1,0 +1,6 @@
+# CircuitPython libraries needed on the Pico (install with circup).
+#   pip install circup
+#   circup install -r circup-requirements.txt
+# See: https://github.com/adafruit/circup
+adafruit_requests
+adafruit_connection_manager

@@ -1,0 +1,11 @@
+# settings.toml  —  Pico 2 W configuration (CircuitPython reads this automatically)
+# Edit the values, then copy this file to the root of the CIRCUITPY drive.
+
+WIFI_SSID     = "YourWiFiName"
+WIFI_PASSWORD = "YourWiFiPassword"
+
+# The PC on the same network that runs server.py (find its IP with ipconfig).
+SERVER_URL    = "http://192.168.1.50:8000"
+
+# Must match DEVICE_KEY in server.py
+DEVICE_KEY    = "pico-770"
