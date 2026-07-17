@@ -14,16 +14,45 @@ then open   http://localhost:8000   in your browser.
 Login: admin / admin
 """
 
-import http.server, socketserver, json, sqlite3, os, urllib.parse
+import http.server, socketserver, json, sqlite3, os, urllib.parse, datetime, time
+import sys, threading, webbrowser
 
 PORT = 8000
-DB   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cnc.db")
-ROOT = os.path.dirname(os.path.abspath(__file__))
+# Works both as a .py script and as a bundled .exe (PyInstaller sets sys.frozen).
+if getattr(sys, "frozen", False):
+    BASE = os.path.dirname(sys.executable)
+else:
+    BASE = os.path.dirname(os.path.abspath(__file__))
+DB   = os.path.join(BASE, "cnc.db")
+ROOT = BASE
 
 # --- admin credentials (demo). Change these for real use. ---
 ADMIN_USER  = "admin"
 ADMIN_PASS  = "admin"
 ADMIN_TOKEN = "demo-token-770"
+# --- device key: the on-machine Pico sends this to verify a card + PIN ---
+DEVICE_KEY  = "pico-770"
+
+def now_str():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+# --- last card the reader scanned (for the web "Scan" / enrollment button) ---
+LAST_SCAN = {"uid": None, "at": 0.0}
+
+# --- system update history shown on the System tab ---
+CHANGELOG = [
+    {"version": "1.2", "date": "2026-07-17", "items": [
+        "Pico hardware integration: /api/verify checks card + PIN against SQLite and logs the access",
+        "Sign-out closes the session (/api/logout); machine event logging (/api/event)",
+        "RFID enrollment: the reader posts to /api/scan and the web Scan button pulls it via /api/last-scan",
+        "New System tab: live server / database / reader status + this update history",
+        "Boot health check (/api/health)"]},
+    {"version": "1.1", "date": "2026-07-09", "items": [
+        "Real SQLite backend + REST API (server.py) — every change persists and syncs",
+        "Admin login; all writes require a token"]},
+    {"version": "1.0", "date": "2026-07-09", "items": [
+        "Front-end MVP: Users, Logs, and Safety Checklist screens"]},
+]
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -49,9 +78,10 @@ CREATE TABLE IF NOT EXISTS event_logs (
 """
 
 SEED_USERS = [
-    ("Mason Wang",    "A1B2C3D4", "0770", "A",    "active"),
-    ("Erik Marshall", "0F1E2D3C", "1234", "A",    "active"),
-    ("Test User",     "99887766", "0000", "B",    "disabled"),
+    ("Mason Wang",       "A1B2C3D4", "0770", "A",    "active"),
+    ("Erik Marshall",    "0F1E2D3C", "1234", "A",    "active"),
+    ("Glenn (test card)","A388DB1C", "7789", "A",    "active"),   # real reader test card
+    ("Test User",        "99887766", "0000", "B",    "disabled"),
 ]
 SEED_ACCESS = [
     (1, "2026-07-08 14:02", "2026-07-08 14:48"),
@@ -111,6 +141,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def authed(self):
         return self.headers.get("X-Admin-Token") == ADMIN_TOKEN
 
+    def is_device(self):
+        return self.headers.get("X-Device-Key") == DEVICE_KEY
+
     def serve_static(self, path):
         if path in ("/", "/index.html"):
             fname = "index.html"
@@ -132,6 +165,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ---------- GET ----------
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
+        if path == "/api/health":
+            # lightweight reachability check for the Pico at boot
+            return self.send_json({"ok": True, "service": "CNC Access Manager",
+                                   "version": "1.2"})
+        if path == "/api/last-scan":
+            # the most recent card the reader posted (for enrollment)
+            age = None
+            if LAST_SCAN["uid"] and LAST_SCAN["at"]:
+                a = round(time.time() - LAST_SCAN["at"], 1)
+                age = a if a <= 60 else None
+            return self.send_json({"uid": LAST_SCAN["uid"] if age is not None else None,
+                                   "age": age})
+        if path == "/api/system":
+            con = db()
+            users = con.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+            active = con.execute("SELECT COUNT(*) c FROM users WHERE status='active'").fetchone()["c"]
+            opens = con.execute("SELECT COUNT(*) c FROM access_logs WHERE logout_at IS NULL").fetchone()["c"]
+            con.close()
+            scan_age = None
+            if LAST_SCAN["at"]:
+                a = round(time.time() - LAST_SCAN["at"], 1)
+                scan_age = a if a <= 3600 else None
+            return self.send_json({"ok": True, "version": "1.2", "users": users,
+                                   "active_users": active, "open_sessions": opens,
+                                   "last_scan_age": scan_age, "changelog": CHANGELOG})
         if path == "/api/users":
             con = db()
             rows = [dict(r) for r in con.execute(
@@ -179,6 +237,77 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json({"error": str(e)}, 400)
             finally:
                 con.close()
+
+        # ---- called by the on-machine Pico: check a card + PIN ----
+        if path == "/api/verify":
+            if not self.is_device():
+                return self.send_json({"authorized": False, "error": "bad device key"}, 401)
+            d = self.body_json()
+            rfid = (d.get("rfid_hex") or "").strip().upper()
+            pin  = (d.get("pin") or "").strip()
+            con = db()
+            row = con.execute(
+                "SELECT id,name,cert_level,pin,status FROM users WHERE upper(rfid_hex)=?",
+                (rfid,)).fetchone()
+            ok = bool(row) and row["status"] == "active" and row["pin"] == pin
+            if ok:
+                con.execute(
+                    "INSERT INTO access_logs(user_id,login_at,logout_at) VALUES(?,?,?)",
+                    (row["id"], now_str(), None))
+                con.commit()
+            con.close()
+            if ok:
+                return self.send_json({"authorized": True,
+                                       "name": row["name"],
+                                       "cert_level": row["cert_level"]})
+            reason = ("unknown card" if not row
+                      else ("disabled" if row["status"] != "active" else "bad pin"))
+            return self.send_json({"authorized": False, "reason": reason})
+
+        # ---- reader posts a scanned card UID here (enrollment) ----
+        if path == "/api/scan":
+            if not self.is_device():
+                return self.send_json({"error": "bad device key"}, 401)
+            d = self.body_json()
+            uid = (d.get("uid") or d.get("rfid_hex") or "").strip().upper()
+            if uid:
+                LAST_SCAN["uid"] = uid
+                LAST_SCAN["at"] = time.time()
+            return self.send_json({"ok": True})
+
+        # ---- log a machine event (crash / dull bit / clean) ----
+        if path == "/api/event":
+            if not (self.is_device() or self.authed()):
+                return self.send_json({"error": "unauthorized"}, 401)
+            d = self.body_json()
+            rfid = (d.get("rfid_hex") or "").strip().upper()
+            con = db()
+            row = con.execute("SELECT id FROM users WHERE upper(rfid_hex)=?", (rfid,)).fetchone()
+            con.execute(
+                "INSERT INTO event_logs(user_id,type,note,created_at) VALUES(?,?,?,?)",
+                (row["id"] if row else None, d.get("type", "ok"), d.get("note", ""), now_str()))
+            con.commit(); con.close()
+            return self.send_json({"ok": True})
+
+        # ---- close the current access session (sign out) ----
+        if path == "/api/logout":
+            if not (self.is_device() or self.authed()):
+                return self.send_json({"error": "unauthorized"}, 401)
+            d = self.body_json()
+            rfid = (d.get("rfid_hex") or "").strip().upper()
+            con = db()
+            row = con.execute("SELECT id FROM users WHERE upper(rfid_hex)=?", (rfid,)).fetchone()
+            if row:
+                con.execute("""
+                    UPDATE access_logs SET logout_at=?
+                    WHERE id = (SELECT id FROM access_logs
+                                WHERE user_id=? AND logout_at IS NULL
+                                ORDER BY id DESC LIMIT 1)""",
+                    (now_str(), row["id"]))
+                con.commit()
+            con.close()
+            return self.send_json({"ok": True})
+
         self.send_error(404)
 
     # ---------- PUT ----------
@@ -216,9 +345,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
+    # open the browser automatically ~1s after the server starts (one-click use)
+    threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
     with socketserver.ThreadingTCPServer(("", PORT), Handler) as httpd:
         print(f"CNC Access Manager running →  http://localhost:{PORT}")
-        print("Login: admin / admin   ·   Ctrl+C to stop")
+        print("A browser tab will open automatically.  Login: admin / admin")
+        print("Keep this window open.  Ctrl+C (or close window) to stop.")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

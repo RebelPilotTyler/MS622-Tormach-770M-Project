@@ -1,0 +1,7 @@
+cnc.db
+__pycache__/
+*.pyc
+dist/
+build/
+portable/
+*.spec

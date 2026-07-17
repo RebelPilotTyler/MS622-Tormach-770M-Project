@@ -39,13 +39,14 @@
       <button class="tab active" data-page="users"  onclick="showPage('users')">Users</button>
       <button class="tab"        data-page="logs"   onclick="showPage('logs')">Logs</button>
       <button class="tab"        data-page="safety" onclick="showPage('safety')">Safety Checklist</button>
+      <button class="tab"        data-page="system" onclick="showPage('system')">System</button>
     </nav>
 
     <!-- ============ PAGE 2: USERS ============ -->
     <section id="page-users" class="page">
       <div class="toolbar">
         <input id="search" type="text" placeholder="Search name or card…" oninput="renderUsers()">
-        <button class="primary" onclick="openForm()">＋ Add user</button>
+        <button class="primary" onclick="openForm()">+ Add user</button>
       </div>
       <table id="userTable">
         <thead>
@@ -93,6 +94,26 @@
       <button class="ghost small" onclick="resetChecklist()">Reset checklist</button>
     </section>
 
+    <!-- ============ PAGE 6: SYSTEM / STATUS + UPDATES ============ -->
+    <section id="page-system" class="page" hidden>
+      <h2 class="page-title">System status</h2>
+      <p class="page-note">Live check of the parts that can be verified from here.
+        <button class="ghost small" onclick="renderSystem()">Refresh</button></p>
+      <div id="statusCards" class="status-grid"></div>
+
+      <h2 class="page-title" style="margin-top:28px">Testing without hardware</h2>
+      <p class="page-note">No reader yet? Simulate a card tap here, then open Add user and press Scan within ~12&nbsp;s.</p>
+      <div class="scan-row" style="max-width:420px">
+        <input id="simUid" type="text" value="A388DB1C" placeholder="card UID (hex)">
+        <button class="ghost" onclick="simulateTap()">Simulate tap</button>
+      </div>
+      <small id="simMsg" class="page-note"></small>
+
+      <h2 class="page-title" style="margin-top:28px">Update history</h2>
+      <p class="page-note">What has been built and changed in this system.</p>
+      <div id="changelog"></div>
+    </section>
+
     <!-- ============ PAGE 3: ADD / EDIT USER (modal) ============ -->
     <div id="overlay" class="overlay" hidden>
       <div class="modal">
@@ -105,9 +126,9 @@
             <div class="scan-row">
               <input id="f_rfid" type="text" placeholder="e.g. A1B2C3D4" required
                      pattern="[0-9A-Fa-f]{8}([0-9A-Fa-f]{6})?">
-              <button type="button" class="ghost" onclick="mockScan()">Scan</button>
+              <button type="button" class="ghost" onclick="scanCard()">Scan</button>
             </div>
-            <small>When the reader is connected, this fills in automatically.</small>
+            <small id="scanHint">Tap a card on the reader after pressing Scan, or type the ID manually.</small>
           </label>
           <label>PIN (4 digits)
             <input id="f_pin" type="text" inputmode="numeric" pattern="\d{4}" maxlength="4" required>

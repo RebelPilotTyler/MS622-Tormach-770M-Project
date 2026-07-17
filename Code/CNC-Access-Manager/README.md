@@ -47,4 +47,3 @@ Or on Windows just double-click `start.bat`.
 - Hash PINs (salted SHA-256) instead of storing plaintext.
 - Move this same API onto the Raspberry Pi Pico W (Microdot) to drive the machine relay.
 - Serve over HTTPS on the lab network.
-

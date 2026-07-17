@@ -86,9 +86,11 @@ function showPage(name){
   document.getElementById('page-' + name).hidden = false;
   document.querySelectorAll('.tab').forEach(t =>
     t.classList.toggle('active', t.dataset.page === name));
-  if (name === 'logs')  renderLogs();
-  if (name === 'users') loadUsers();
+  if (name === 'logs')   renderLogs();
+  if (name === 'users')  loadUsers();
+  if (name === 'system') renderSystem();
 }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ================= PAGE 2: USERS ================= */
 async function loadUsers(){
@@ -166,10 +168,77 @@ async function saveUser(e){
     alert('Save failed: ' + err.message);   // e.g. duplicate card number
   }
 }
-function mockScan(){
-  const hex = Array.from({length: 4}, () =>
-    Math.floor(Math.random() * 256).toString(16).padStart(2, '0')).join('').toUpperCase();
-  document.getElementById('f_rfid').value = hex;
+/* Real enrollment: the reader (Pico in enroll mode) POSTs the scanned UID to
+   /api/scan; this button pulls the card tapped *after* it was pressed. No reader
+   connected → tells you to type it manually (never fabricates a fake ID). */
+async function scanCard(){
+  const hint = document.getElementById('scanHint');
+  const t0 = Date.now();
+  hint.textContent = 'Waiting for a card tap on the reader…';
+  for (let i = 0; i < 20; i++) {          // poll ~12s
+    try {
+      const d = await apiGet('/api/last-scan');
+      // accept only a scan that happened after this button was pressed
+      if (d.uid && d.age != null && d.age <= (Date.now() - t0) / 1000 + 1) {
+        document.getElementById('f_rfid').value = d.uid;
+        hint.textContent = 'Card read: ' + d.uid;
+        return;
+      }
+    } catch (e) { /* keep polling */ }
+    await sleep(600);
+  }
+  hint.textContent = 'No card detected from a reader. Type the card ID manually ' +
+                     '(or run enroll mode on the Pico — see INTEGRATION.md).';
+}
+
+/* ================= PAGE 6: SYSTEM / STATUS + UPDATES ================= */
+async function renderSystem(){
+  const cards = document.getElementById('statusCards');
+  const log   = document.getElementById('changelog');
+  let s;
+  try { s = await apiGet('/api/system'); }
+  catch (e) {
+    cards.innerHTML = statusCard('Server', 'down', 'Cannot reach server.py');
+    return;
+  }
+  const scan = (s.last_scan_age == null)
+    ? statusCard('Card reader', 'unknown', 'No card seen yet — reader not confirmed / no hardware')
+    : statusCard('Card reader', 'ok', 'Last card scanned ' + s.last_scan_age + 's ago');
+  cards.innerHTML =
+      statusCard('Server (server.py)', 'ok', 'Reachable · API v' + s.version)
+    + statusCard('Database (cnc.db)', 'ok', s.users + ' users · ' + s.active_users + ' active')
+    + statusCard('Live sessions', s.open_sessions ? 'ok' : 'idle',
+                 s.open_sessions + ' machine session(s) open')
+    + scan;
+
+  log.innerHTML = s.changelog.map(v => `
+    <div class="rel">
+      <div class="rel-head"><strong>v${v.version}</strong> <span class="muted">${v.date}</span></div>
+      <ul>${v.items.map(it => '<li>' + escapeHtml(it) + '</li>').join('')}</ul>
+    </div>`).join('');
+}
+/* Testing helper: feed the enrollment channel without a real reader.
+   Sends a UID to /api/scan so the Add-user "Scan" button can pull it. */
+async function simulateTap(){
+  const uid = document.getElementById('simUid').value.trim().toUpperCase();
+  const msg = document.getElementById('simMsg');
+  try {
+    await fetch(API + '/api/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Device-Key': 'pico-770' },
+      body: JSON.stringify({ uid }),
+    });
+    msg.textContent = 'Sent ' + uid + ' — now open Add user and press Scan within ~12 s.';
+    renderSystem();
+  } catch (e) {
+    msg.textContent = 'Failed: ' + e.message;
+  }
+}
+function statusCard(title, state, detail){
+  return `<div class="scard ${state}">
+    <div class="scard-dot"></div>
+    <div><div class="scard-title">${escapeHtml(title)}</div>
+    <div class="scard-detail">${escapeHtml(detail)}</div></div></div>`;
 }
 
 /* ================= PAGE 4: LOGS ================= */

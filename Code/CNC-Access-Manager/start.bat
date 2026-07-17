@@ -8,13 +8,11 @@ REM ============================================================
 title CNC Access Manager launcher
 cd /d "%~dp0"
 
-echo Starting CNC Access Manager...
+REM Pick python launcher: prefer "py", fall back to "python"
+set "PYEXE=py"
+where py >nul 2>nul || set "PYEXE=python"
 
-REM Start the Python server in its own window (stays open)
-start "CNC server" cmd /k py server.py
+echo Starting CNC Access Manager with %PYEXE% ...
 
-REM Give the server a moment to boot, then open the browser
-timeout /t 2 >nul
-start "" http://localhost:8000
-
-exit
+REM Start the server (it opens the browser automatically)
+%PYEXE% server.py
