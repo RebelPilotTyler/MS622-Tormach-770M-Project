@@ -15,7 +15,7 @@ Login: admin / admin
 """
 
 import http.server, socketserver, json, sqlite3, os, urllib.parse, datetime, time
-import sys, threading, webbrowser
+import sys, threading, webbrowser, hashlib, hmac, secrets
 
 PORT = 8000
 # Works both as a .py script and as a bundled .exe (PyInstaller sets sys.frozen).
@@ -27,20 +27,69 @@ DB   = os.path.join(BASE, "cnc.db")
 ROOT = BASE
 
 # --- admin credentials (demo). Change these for real use. ---
-ADMIN_USER  = "admin"
-ADMIN_PASS  = "admin"
-ADMIN_TOKEN = "demo-token-770"
+# v1.3: the password is no longer stored in the clear. Replace ADMIN_PASS_HASH
+# with the SHA-256 of your own password:
+#     python -c "import hashlib;print(hashlib.sha256(b'yourpass').hexdigest())"
+ADMIN_USER      = "admin"
+ADMIN_PASS_HASH = hashlib.sha256(b"admin").hexdigest()
+ADMIN_TOKEN     = "demo-token-770"
 # --- device key: the on-machine Pico sends this to verify a card + PIN ---
 DEVICE_KEY  = "pico-770"
 
 def now_str():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
+
+# =============================================================================
+# PIN hashing (v1.3)
+# -----------------------------------------------------------------------------
+# PINs are only 4 digits, so a plain SHA-256 is trivially reversible with a
+# 10,000-entry table. Each user therefore gets a random 16-byte salt and the PIN
+# is stretched with PBKDF2-HMAC-SHA256. The database never stores the PIN.
+# `hmac.compare_digest` is used so the comparison is constant-time.
+# =============================================================================
+PIN_ITERATIONS = 100_000
+
+def make_salt():
+    return secrets.token_hex(16)
+
+def hash_pin(pin, salt):
+    return hashlib.pbkdf2_hmac(
+        "sha256", str(pin).encode(), bytes.fromhex(salt), PIN_ITERATIONS
+    ).hex()
+
+def pin_ok(row, pin):
+    """Constant-time check of a submitted PIN against a users row."""
+    if not row or not row["pin_salt"] or not row["pin_hash"]:
+        return False
+    return hmac.compare_digest(row["pin_hash"], hash_pin(pin, row["pin_salt"]))
+
+
+# --- offline verifier for the reader's cache -------------------------------
+# The Pico cannot run 100,000 PBKDF2 rounds (it would take minutes per tap), so
+# the roster it caches carries a second, cheap verifier: one HMAC-SHA256 keyed
+# by OFFLINE_KEY, a secret shared only with the reader. This is deliberately
+# weaker than the online path, and it is only ever consulted when the server is
+# unreachable. Trade-off accepted so the mill stays usable during an outage.
+OFFLINE_KEY = b"cnc-770-offline-pepper-change-me"
+
+def offline_hash(rfid_hex, pin):
+    msg = (rfid_hex.strip().upper() + ":" + str(pin).strip()).encode()
+    return hmac.new(OFFLINE_KEY, msg, hashlib.sha256).hexdigest()
+
 # --- last card the reader scanned (for the web "Scan" / enrollment button) ---
 LAST_SCAN = {"uid": None, "at": 0.0}
 
 # --- system update history shown on the System tab ---
 CHANGELOG = [
+    {"version": "1.3", "date": "2026-07-24", "items": [
+        "Security: PINs are now stored as salted PBKDF2-HMAC-SHA256 hashes, never in plaintext "
+        "(existing databases are migrated automatically on start)",
+        "Security: the admin password is compared as a hash, in constant time",
+        "Reliability: the reader keeps a cached roster (/api/roster) so the mill stays usable "
+        "if Wi-Fi or this PC goes down",
+        "Reliability: access taps recorded while offline are uploaded on reconnect (/api/sync)",
+        "Reviewed against Glenn's 7/17 firmware — pin map, timings and RC522 driver confirmed identical"]},
     {"version": "1.2", "date": "2026-07-17", "items": [
         "Pico hardware integration: /api/verify checks card + PIN against SQLite and logs the access",
         "Sign-out closes the session (/api/logout); machine event logging (/api/event)",
@@ -60,7 +109,10 @@ CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   rfid_hex TEXT NOT NULL UNIQUE,
-  pin TEXT NOT NULL,
+  pin TEXT,                       -- legacy plaintext column, emptied by migrate_db()
+  pin_hash TEXT,                  -- v1.3: PBKDF2-HMAC-SHA256 of the PIN
+  pin_salt TEXT,                  -- v1.3: per-user random salt (hex)
+  offline_hash TEXT,              -- v1.3: cheap HMAC verifier for the reader's offline cache
   cert_level TEXT NOT NULL DEFAULT 'none',
   status TEXT NOT NULL DEFAULT 'active',
   created_at TEXT DEFAULT (datetime('now'))
@@ -102,14 +154,45 @@ def db():
     return con
 
 
+def migrate_db(con):
+    """v1.3 migration: add pin_hash/pin_salt, hash any plaintext PINs, clear them.
+
+    Safe to run on every start — it only acts on rows that still need it.
+    """
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(users)")}
+    for col in ("pin_hash", "pin_salt", "offline_hash"):
+        if col not in cols:
+            con.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+    rows = con.execute(
+        "SELECT id, rfid_hex, pin FROM users"
+        " WHERE pin_hash IS NULL AND pin IS NOT NULL AND pin != ''"
+    ).fetchall()
+    for r in rows:
+        salt = make_salt()
+        con.execute(
+            "UPDATE users SET pin_hash=?, pin_salt=?, offline_hash=?, pin='' WHERE id=?",
+            (hash_pin(r["pin"], salt), salt, offline_hash(r["rfid_hex"], r["pin"]), r["id"]))
+    if rows:
+        con.commit()
+        print(f"Migrated {len(rows)} PIN(s) to salted hashes (plaintext cleared).")
+
+
+def seed_user(con, name, rfid, pin, level, status):
+    salt = make_salt()
+    return con.execute(
+        "INSERT INTO users(name,rfid_hex,pin,pin_hash,pin_salt,offline_hash,cert_level,status)"
+        " VALUES(?,?,'',?,?,?,?,?)",
+        (name, rfid, hash_pin(pin, salt), salt, offline_hash(rfid, pin), level, status))
+
+
 def init_db():
     fresh = not os.path.exists(DB)
     con = db()
     con.executescript(SCHEMA)
+    migrate_db(con)
     if fresh or con.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
-        con.executemany(
-            "INSERT INTO users(name,rfid_hex,pin,cert_level,status) VALUES(?,?,?,?,?)",
-            SEED_USERS)
+        for u in SEED_USERS:
+            seed_user(con, *u)
         con.executemany(
             "INSERT INTO access_logs(user_id,login_at,logout_at) VALUES(?,?,?)",
             SEED_ACCESS)
@@ -168,7 +251,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/health":
             # lightweight reachability check for the Pico at boot
             return self.send_json({"ok": True, "service": "CNC Access Manager",
-                                   "version": "1.2"})
+                                   "version": "1.3"})
         if path == "/api/last-scan":
             # the most recent card the reader posted (for enrollment)
             age = None
@@ -187,15 +270,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if LAST_SCAN["at"]:
                 a = round(time.time() - LAST_SCAN["at"], 1)
                 scan_age = a if a <= 3600 else None
-            return self.send_json({"ok": True, "version": "1.2", "users": users,
+            return self.send_json({"ok": True, "version": "1.3", "users": users,
                                    "active_users": active, "open_sessions": opens,
                                    "last_scan_age": scan_age, "changelog": CHANGELOG})
         if path == "/api/users":
+            # v1.3: PINs are hashed, so the admin page can no longer display them.
             con = db()
             rows = [dict(r) for r in con.execute(
-                "SELECT id,name,rfid_hex,pin,cert_level,status FROM users ORDER BY id")]
+                "SELECT id,name,rfid_hex,cert_level,status,"
+                "       (pin_hash IS NOT NULL) AS has_pin"
+                " FROM users ORDER BY id")]
             con.close()
             return self.send_json(rows)
+
+        # ---- roster for the Pico's offline cache (v1.3) ----
+        # Sends hashes only, never PINs, so a stolen Pico does not leak them.
+        if path == "/api/roster":
+            if not self.is_device():
+                return self.send_json({"error": "bad device key"}, 401)
+            con = db()
+            rows = [{"rfid_hex": r["rfid_hex"].upper(),
+                     "name": r["name"],
+                     "cert_level": r["cert_level"],
+                     "offline_hash": r["offline_hash"]}
+                    for r in con.execute(
+                        "SELECT rfid_hex,name,cert_level,offline_hash FROM users"
+                        " WHERE status='active' AND offline_hash IS NOT NULL")]
+            con.close()
+            return self.send_json({"ok": True, "issued_at": now_str(), "users": rows})
         if path == "/api/logs":
             con = db()
             access = [dict(r) for r in con.execute("""
@@ -217,21 +319,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/api/login":
             d = self.body_json()
-            if d.get("username") == ADMIN_USER and d.get("password") == ADMIN_PASS:
+            supplied = hashlib.sha256((d.get("password") or "").encode()).hexdigest()
+            if d.get("username") == ADMIN_USER and hmac.compare_digest(supplied, ADMIN_PASS_HASH):
                 return self.send_json({"ok": True, "token": ADMIN_TOKEN})
             return self.send_json({"ok": False}, 401)
         if path == "/api/users":
             if not self.authed():
                 return self.send_json({"error": "unauthorized"}, 401)
             d = self.body_json()
+            pin = str(d.get("pin", "")).strip()
+            if not (len(pin) == 4 and pin.isdigit()):
+                return self.send_json({"error": "PIN must be exactly 4 digits"}, 400)
             con = db()
             try:
+                salt = make_salt()
                 cur = con.execute(
-                    "INSERT INTO users(name,rfid_hex,pin,cert_level,status) VALUES(?,?,?,?,?)",
-                    (d["name"], d["rfid_hex"], d["pin"], d.get("cert_level", "none"),
-                     d.get("status", "active")))
+                    "INSERT INTO users(name,rfid_hex,pin,pin_hash,pin_salt,offline_hash,"
+                    "                  cert_level,status) VALUES(?,?,'',?,?,?,?,?)",
+                    (d["name"], d["rfid_hex"], hash_pin(pin, salt), salt,
+                     offline_hash(d["rfid_hex"], pin),
+                     d.get("cert_level", "none"), d.get("status", "active")))
                 con.commit()
                 d["id"] = cur.lastrowid
+                d.pop("pin", None)          # never echo the PIN back
                 return self.send_json(d, 201)
             except sqlite3.IntegrityError as e:
                 return self.send_json({"error": str(e)}, 400)
@@ -247,9 +357,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pin  = (d.get("pin") or "").strip()
             con = db()
             row = con.execute(
-                "SELECT id,name,cert_level,pin,status FROM users WHERE upper(rfid_hex)=?",
-                (rfid,)).fetchone()
-            ok = bool(row) and row["status"] == "active" and row["pin"] == pin
+                "SELECT id,name,cert_level,pin_hash,pin_salt,status FROM users"
+                " WHERE upper(rfid_hex)=?", (rfid,)).fetchone()
+            ok = bool(row) and row["status"] == "active" and pin_ok(row, pin)
             if ok:
                 con.execute(
                     "INSERT INTO access_logs(user_id,login_at,logout_at) VALUES(?,?,?)",
@@ -289,6 +399,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
             con.commit(); con.close()
             return self.send_json({"ok": True})
 
+        # ---- the Pico uploads records it buffered while offline (v1.3) ----
+        if path == "/api/sync":
+            if not self.is_device():
+                return self.send_json({"error": "bad device key"}, 401)
+            d = self.body_json()
+            entries = d.get("entries") or []
+            con = db()
+            saved = 0
+            for e in entries:
+                rfid = (e.get("rfid_hex") or "").strip().upper()
+                row = con.execute("SELECT id FROM users WHERE upper(rfid_hex)=?",
+                                  (rfid,)).fetchone()
+                uid = row["id"] if row else None
+                when = e.get("at") or now_str()
+                kind = e.get("kind")
+                if kind == "login":
+                    con.execute("INSERT INTO access_logs(user_id,login_at,logout_at)"
+                                " VALUES(?,?,?)", (uid, when, e.get("logout_at")))
+                elif kind == "logout":
+                    con.execute("""
+                        UPDATE access_logs SET logout_at=?
+                        WHERE id = (SELECT id FROM access_logs
+                                    WHERE user_id=? AND logout_at IS NULL
+                                    ORDER BY id DESC LIMIT 1)""", (when, uid))
+                else:
+                    con.execute("INSERT INTO event_logs(user_id,type,note,created_at)"
+                                " VALUES(?,?,?,?)",
+                                (uid, e.get("type", "offline"),
+                                 e.get("note", "buffered on the reader"), when))
+                saved += 1
+            con.commit(); con.close()
+            return self.send_json({"ok": True, "saved": saved})
+
         # ---- close the current access session (sign out) ----
         if path == "/api/logout":
             if not (self.is_device() or self.authed()):
@@ -318,10 +461,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json({"error": "unauthorized"}, 401)
             uid = int(path.rsplit("/", 1)[-1])
             d = self.body_json()
+            pin = str(d.get("pin", "")).strip()
             con = db()
             con.execute(
-                "UPDATE users SET name=?,rfid_hex=?,pin=?,cert_level=?,status=? WHERE id=?",
-                (d["name"], d["rfid_hex"], d["pin"], d["cert_level"], d["status"], uid))
+                "UPDATE users SET name=?,rfid_hex=?,cert_level=?,status=? WHERE id=?",
+                (d["name"], d["rfid_hex"], d["cert_level"], d["status"], uid))
+            # An empty PIN field means "keep the current PIN" — we cannot show the
+            # old one in the form any more, because only its hash is stored.
+            if pin:
+                if not (len(pin) == 4 and pin.isdigit()):
+                    con.close()
+                    return self.send_json({"error": "PIN must be exactly 4 digits"}, 400)
+                salt = make_salt()
+                con.execute(
+                    "UPDATE users SET pin='', pin_hash=?, pin_salt=?, offline_hash=? WHERE id=?",
+                    (hash_pin(pin, salt), salt, offline_hash(d["rfid_hex"], pin), uid))
             con.commit(); con.close()
             return self.send_json({"ok": True})
         self.send_error(404)

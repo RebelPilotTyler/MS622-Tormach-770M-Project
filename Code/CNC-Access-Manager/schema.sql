@@ -5,14 +5,21 @@ DROP TABLE IF EXISTS event_logs;
 DROP TABLE IF EXISTS access_logs;
 DROP TABLE IF EXISTS users;
 
+-- NOTE (v1.3): PINs are no longer stored in the clear. server.py creates and
+-- migrates the database itself on start, including hashing any legacy plaintext
+-- PINs, so this file is a reference for the shape of the tables. Seed rows below
+-- deliberately leave the hash columns NULL — run server.py to populate them.
 CREATE TABLE users (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  name       TEXT    NOT NULL,
-  rfid_hex   TEXT    NOT NULL UNIQUE,
-  pin        TEXT    NOT NULL,
-  cert_level TEXT    NOT NULL DEFAULT 'none',   -- A / B / none
-  status     TEXT    NOT NULL DEFAULT 'active', -- active / disabled
-  created_at TEXT    DEFAULT (datetime('now'))
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  name         TEXT    NOT NULL,
+  rfid_hex     TEXT    NOT NULL UNIQUE,
+  pin          TEXT,                              -- legacy column, emptied by migration
+  pin_hash     TEXT,                              -- PBKDF2-HMAC-SHA256 (100k rounds)
+  pin_salt     TEXT,                              -- per-user random salt (hex)
+  offline_hash TEXT,                              -- HMAC verifier for the reader's cache
+  cert_level   TEXT    NOT NULL DEFAULT 'none',   -- A / B / none
+  status       TEXT    NOT NULL DEFAULT 'active', -- active / disabled
+  created_at   TEXT    DEFAULT (datetime('now'))
 );
 
 CREATE TABLE access_logs (

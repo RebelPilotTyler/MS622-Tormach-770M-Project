@@ -51,7 +51,7 @@
       <table id="userTable">
         <thead>
           <tr>
-            <th>Name</th><th>Card (RFID hex)</th><th>PIN</th>
+            <th>Name</th><th>Card (RFID hex)</th><th>PIN (hashed)</th>
             <th>Level</th><th>Status</th><th class="actions">Actions</th>
           </tr>
         </thead>
@@ -131,7 +131,9 @@
             <small id="scanHint">Tap a card on the reader after pressing Scan, or type the ID manually.</small>
           </label>
           <label>PIN (4 digits)
-            <input id="f_pin" type="text" inputmode="numeric" pattern="\d{4}" maxlength="4" required>
+            <input id="f_pin" type="password" inputmode="numeric" pattern="\d{4}"
+                   maxlength="4" autocomplete="new-password" required>
+            <small id="pinHint">Stored as a salted hash. It cannot be read back later.</small>
           </label>
           <label>Certification level
             <select id="f_level">

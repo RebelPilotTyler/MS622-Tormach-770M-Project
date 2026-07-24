@@ -107,7 +107,7 @@ function renderUsers(){
     <tr>
       <td>${escapeHtml(u.name)}</td>
       <td><code>${u.rfid_hex}</code></td>
-      <td>${u.pin}</td>
+      <td class="pin-cell">${u.has_pin ? '••••' : '<em>not set</em>'}</td>
       <td class="lvl-${u.cert_level}">${u.cert_level}</td>
       <td><span class="badge ${u.status}">${u.status}</span></td>
       <td class="actions">
@@ -141,7 +141,15 @@ function openForm(id){
   document.getElementById('formTitle').textContent = u ? 'Edit user' : 'Add user';
   document.getElementById('f_name').value   = u ? u.name : '';
   document.getElementById('f_rfid').value   = u ? u.rfid_hex : '';
-  document.getElementById('f_pin').value    = u ? u.pin : '';
+  /* v1.3: PINs are stored hashed, so an existing PIN can never be shown again.
+     Editing a user leaves the field blank = "keep the current PIN". */
+  const pinField = document.getElementById('f_pin');
+  pinField.value       = '';
+  pinField.required    = !u;
+  pinField.placeholder = u ? 'leave blank to keep current PIN' : '4 digits';
+  document.getElementById('pinHint').textContent = u
+    ? 'Stored as a salted hash — leave blank to keep the current PIN, or type a new one.'
+    : 'Stored as a salted hash. It cannot be read back later.';
   document.getElementById('f_level').value  = u ? u.cert_level : 'A';
   document.getElementById('f_status').value = u ? u.status : 'active';
   document.getElementById('overlay').hidden = false;
