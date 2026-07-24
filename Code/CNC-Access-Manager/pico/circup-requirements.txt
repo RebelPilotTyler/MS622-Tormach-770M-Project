@@ -4,3 +4,4 @@
 # See: https://github.com/adafruit/circup
 adafruit_requests
 adafruit_connection_manager
+adafruit_hashlib

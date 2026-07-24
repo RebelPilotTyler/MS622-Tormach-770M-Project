@@ -9,3 +9,12 @@ SERVER_URL    = "http://192.168.1.50:8000"
 
 # Must match DEVICE_KEY in server.py
 DEVICE_KEY    = "pico-770"
+
+# Must match OFFLINE_KEY in server.py. Used only to check the cached roster
+# when the server is unreachable — change both sides together.
+OFFLINE_KEY   = "cnc-770-offline-pepper-change-me"
+
+# GPIO number driving the machine-enable relay.
+# NOT YET CONFIRMED — Glenn's firmware has no relay output, and Erik's example
+# used GP15. Set this to whatever Glenn confirms is free; no code edit needed.
+RELAY_GP      = "16"

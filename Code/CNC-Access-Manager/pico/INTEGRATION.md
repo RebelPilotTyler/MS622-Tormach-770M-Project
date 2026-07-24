@@ -28,19 +28,38 @@ server logs every access. Adding/removing users happens only in the web app.
 | File | Purpose |
 |------|---------|
 | `code.py` | main controller (auto-runs) |
-| `mfrc522_i2c.py` | Glenn's I2C RFID driver |
-| `settings.toml` | Wi-Fi + server IP + device key |
+| `boot.py` | remounts CIRCUITPY writable so the offline cache can be saved |
+| `mfrc522_i2c.py` | Glenn's I2C RFID driver (identical to his GitHub copy) |
+| `settings.toml` | Wi-Fi + server IP + device key + offline key + relay pin |
 | `/lib/adafruit_requests.mpy` | HTTP client |
 | `/lib/adafruit_connection_manager.mpy` | required by adafruit_requests |
+| `/lib/adafruit_hashlib.mpy` | SHA-256 for the offline PIN check |
+| `roster.json` · `offline_queue.json` | created automatically by `code.py` |
 
 `rfid_test.py` = standalone reader test. `circup-requirements.txt` = library list.
+
+> **`boot.py` trade-off.** It makes the drive writable to the *board*, which means
+> your *PC* can no longer save files to it. To edit code from the computer again,
+> ground **GP18** while plugging the Pico in — that skips the remount.
 
 ## 3. Wiring (Glenn's build)
 
 - RC522 (I2C): **SDA=GP2, SCL=GP3**, address **0x28**
 - Keypad: C2=GP4, R1=GP5, C1=GP6, R4=GP7, C3=GP8, R3=GP9, R2=GP10
 - LEDs: yellow=GP19, red=GP20, green=GP21 · Buzzer=GP22
-- **Relay (machine enable) = GP16** ← change in `code.py` to match the relay wiring
+- **Relay (machine enable) = GP16 — NOT YET CONFIRMED.** Glenn's firmware has no
+  relay output at all, and Erik's example used GP15. Set `RELAY_GP` in
+  `settings.toml` once Glenn confirms a free pin; no code edit is needed.
+- Optional: **GP18** = hold low at boot to keep the drive writable from the PC.
+
+### LED meaning
+
+| LED | Meaning |
+|-----|---------|
+| Yellow solid | idle, ready for a card — or waiting for the PIN |
+| Green solid | **machine is enabled** (stays on for the whole session) |
+| Red | denied |
+| Two yellow blinks after green | granted from the *cached* roster (server is down) |
 
 ---
 
@@ -129,8 +148,20 @@ system update history.
 ## 7. Robustness built into `code.py`
 
 - **Wi-Fi auto-reconnect** before every request (`ensure_wifi`).
-- **Timeout + retry** on each HTTP call; if the server is unreachable the card is
-  simply denied (fail-safe), never left hanging.
+- **Timeout + retry** on each HTTP call.
+- **Offline operation (v1.3).** Previously, if Wi-Fi or the admin PC went down,
+  `/api/verify` failed and the mill could not be started at all — the lab lost the
+  machine because of a sleeping laptop. The reader now caches the authorized list
+  (`GET /api/roster`, refreshed every 15 min while idle) and verifies against it
+  during an outage, then uploads everything it recorded via `POST /api/sync` when
+  the server comes back. Buffered records are capped at 100 (oldest dropped).
+  Disabled users are never included in the roster, so they cannot slip in offline.
+  *This is the one idea adopted from Erik's Pico W design.*
+- **Offline security trade-off (documented on purpose).** The Pico cannot run
+  100,000 PBKDF2 rounds — it would take minutes per tap. So the roster carries a
+  second, cheaper verifier: one HMAC-SHA256 keyed by `OFFLINE_KEY`, a secret
+  shared only with the reader. It is weaker than the online path and is consulted
+  *only* when the server is unreachable. Accepted so the lab keeps working.
 - **Boot health check** (`GET /api/health`) reports whether the server is reachable.
 - **Wrong-PIN lockout**: after 3 bad PINs the reader blinks red and locks out for
   30 s (both configurable at the top of `code.py`), and logs a `lockout` event.
@@ -143,10 +174,17 @@ system update history.
 |--------|------|------|------|---------|
 | GET  | `/api/health` | none | — | reachability check |
 | POST | `/api/verify` | `X-Device-Key` | `{rfid_hex, pin}` | check card+PIN, log access |
+| GET  | `/api/roster` | `X-Device-Key` | — | **v1.3** authorized list for the offline cache (hashes only) |
+| POST | `/api/sync`   | `X-Device-Key` | `{entries:[…]}` | **v1.3** upload records buffered while offline |
 | POST | `/api/logout` | device/admin | `{rfid_hex}` | close the open session |
 | POST | `/api/event`  | device/admin | `{rfid_hex, type, note}` | log crash/dull-bit/etc. |
 | GET  | `/api/users` · POST/PUT/DELETE | admin for writes | — | web-app user management |
 | GET  | `/api/logs` | none | — | access + event logs |
+
+**PINs are never returned by any endpoint.** `GET /api/users` reports only
+`has_pin: true/false`, and `/api/roster` carries hashes. Since v1.3 the admin page
+cannot display an existing PIN — editing a user and leaving the PIN field blank
+keeps the current one; typing a new one replaces it.
 
 Quick test without hardware (server running):
 ```
@@ -162,9 +200,10 @@ curl -X POST http://localhost:8000/api/verify ^
 
 - **Find the server without a fixed IP:** run the server with an mDNS name so the
   Pico can reach `http://cnc-lab.local:8000` instead of a hard-coded IP.
-- **Security hardening:** hash PINs on the server (salted SHA-256); move the API to
-  HTTPS on the lab network; rotate `DEVICE_KEY`. (Dr. Pacote's cyber audit — noted
-  in the stand-up — fits here.)
+- **Security hardening:** ~~hash PINs on the server~~ **done in v1.3** (salted
+  PBKDF2-HMAC-SHA256, 100k rounds). Still to do: move the API to HTTPS on the lab
+  network, and rotate `DEVICE_KEY` / `OFFLINE_KEY` away from the defaults.
+  (Dr. Pacote's cyber audit — noted in the stand-up — fits here.)
 - **On-machine event entry:** add an LCD + rotary encoder, or let students log a
   crash from the desktop, posting to `/api/event`; optionally email a push
   notification to the instructor when an event is logged.
