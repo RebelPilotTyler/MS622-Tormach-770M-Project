@@ -15,7 +15,7 @@ Login: admin / admin
 """
 
 import http.server, socketserver, json, sqlite3, os, urllib.parse, datetime, time
-import sys, threading, webbrowser, hashlib, hmac, secrets
+import sys, threading, webbrowser, hashlib, hmac, secrets, base64
 
 PORT = 8000
 # Works both as a .py script and as a bundled .exe (PyInstaller sets sys.frozen).
@@ -27,14 +27,17 @@ DB   = os.path.join(BASE, "cnc.db")
 ROOT = BASE
 
 # --- admin credentials (demo). Change these for real use. ---
-# v1.3: the password is no longer stored in the clear. Replace ADMIN_PASS_HASH
-# with the SHA-256 of your own password:
-#     python -c "import hashlib;print(hashlib.sha256(b'yourpass').hexdigest())"
+# v1.4: the admin password is stretched with PBKDF2 and a fixed salt, the same
+# way user PINs are. A bare SHA-256 of a short password is reversible from a
+# rainbow table in seconds, which is the exact problem v1.3 fixed for PINs but
+# left in place here. Print a new hash for your own password with:
+#     python -c "import hashlib;print(hashlib.pbkdf2_hmac('sha256',b'yourpass',b'cnc-admin-salt',100000).hex())"
 ADMIN_USER      = "admin"
-ADMIN_PASS_HASH = hashlib.sha256(b"admin").hexdigest()
-ADMIN_TOKEN     = "demo-token-770"
+ADMIN_SALT      = b"cnc-admin-salt"
+ADMIN_PASS_HASH = hashlib.pbkdf2_hmac("sha256", b"admin", ADMIN_SALT, 100_000).hex()
+ADMIN_TOKEN     = secrets.token_urlsafe(24)   # regenerated on every start
 # --- device key: the on-machine Pico sends this to verify a card + PIN ---
-DEVICE_KEY  = "pico-770"
+DEVICE_KEY  = os.environ.get("CNC_DEVICE_KEY", "pico-770")
 
 def now_str():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -77,11 +80,152 @@ def offline_hash(rfid_hex, pin):
     msg = (rfid_hex.strip().upper() + ":" + str(pin).strip()).encode()
     return hmac.new(OFFLINE_KEY, msg, hashlib.sha256).hexdigest()
 
+
+# =============================================================================
+# Encryption at rest (v1.4)
+# -----------------------------------------------------------------------------
+# Following the cybersecurity review: data should be hashed when it only ever
+# needs to be *compared*, and encrypted when it has to be *read back*.
+#
+#   PIN                 -> hashed  (we only ever ask "does this match?")
+#   admin password      -> hashed  (same reason)
+#   card UID, user name -> ENCRYPTED. The server has to recover these: the card
+#                          UID to match a tap, the name to show on the Logs
+#                          page. A hash cannot be reversed, so a hash is the
+#                          wrong tool here.
+#
+# Why this matters: before v1.4, anyone who copied cnc.db walked away with a
+# clean list of every authorised card UID. RFID cards are clonable by design --
+# the card has to answer any reader that asks -- so that list is the single most
+# damaging thing in the file. The PIN pad is what stops a cloned card being
+# enough, but the UID list should still not be sitting in the open.
+#
+# Fernet (AES-128-CBC + HMAC-SHA256, from the `cryptography` package) does the
+# encryption. It is an OPTIONAL dependency on purpose: if it is not installed
+# the server still runs exactly as it did in v1.3 and says so loudly, so the
+# one-file "double-click and go" property is never lost. Install it with:
+#     pip install cryptography
+#
+# Lookups still work because each card also gets a *blind index*: a keyed
+# HMAC-SHA256 of the UID, stored in rfid_hex. It is deterministic, so
+# "WHERE rfid_hex = ?" is still a single indexed query, but it is one-way, so
+# the index itself leaks nothing.
+# =============================================================================
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+    _HAVE_FERNET = True
+except ImportError:
+    _HAVE_FERNET = False
+
+KEY_FILE = os.path.join(BASE, "secret.key")
+
+def _find_key():
+    """Look for an existing key: CNC_SECRET_KEY, then secret.key beside the DB.
+
+    Deliberately does NOT create one. Auto-generating a key here would be a trap:
+    if secret.key went missing from a database that is already encrypted, a fresh
+    key would load cleanly and then quietly fail to decrypt anything. The key is
+    only ever created by _create_key(), and only for a database with nothing
+    encrypted in it yet.
+    """
+    env = os.environ.get("CNC_SECRET_KEY")
+    if env:
+        return env.encode()
+    if os.path.exists(KEY_FILE):
+        with open(KEY_FILE, "rb") as f:
+            return f.read().strip()
+    return None
+
+def _create_key():
+    key = Fernet.generate_key()
+    with open(KEY_FILE, "wb") as f:
+        f.write(key)
+    try:
+        os.chmod(KEY_FILE, 0o600)      # no-op on some Windows filesystems
+    except OSError:
+        pass
+    print("Generated a new encryption key:", KEY_FILE, "- back this up somewhere")
+    print("  other than next to cnc.db, or the encrypted columns become unreadable.")
+    return key
+
+def _use_key(key):
+    """Install a key and switch encryption on."""
+    global SECRET_KEY, FERNET, ENCRYPTION_ON
+    SECRET_KEY    = key
+    FERNET        = Fernet(key) if key else None
+    ENCRYPTION_ON = FERNET is not None
+
+SECRET_KEY, FERNET, ENCRYPTION_ON = None, None, False
+if _HAVE_FERNET:
+    _use_key(_find_key())
+
+def enc(text):
+    """Encrypt a value that has to be read back later. Returns None if empty."""
+    if not ENCRYPTION_ON or text is None or text == "":
+        return None
+    return FERNET.encrypt(str(text).encode()).decode()
+
+def dec(token, fallback=""):
+    """Decrypt a stored token; fall back to the plaintext column if unset."""
+    if not token:
+        return fallback
+    if not ENCRYPTION_ON:
+        return fallback
+    try:
+        return FERNET.decrypt(token.encode()).decode()
+    except InvalidToken:
+        return fallback
+
+def card_id(rfid):
+    """Blind index for a card UID: deterministic, indexable, not reversible."""
+    u = (rfid or "").strip().upper()
+    if not ENCRYPTION_ON:
+        return u
+    return hmac.new(SECRET_KEY, u.encode(), hashlib.sha256).hexdigest()
+
+def card_where():
+    """WHERE fragment that matches card_id() in both modes."""
+    return "rfid_hex=?" if ENCRYPTION_ON else "upper(rfid_hex)=?"
+
+def user_name(row):
+    """Name for display, whichever column it actually lives in."""
+    try:
+        encrypted = row["name_enc"]
+    except (IndexError, KeyError):
+        encrypted = None
+    return dec(encrypted, row["name"] or "")
+
+def user_card(row):
+    """Real card UID for display / for the reader, decrypted if necessary."""
+    try:
+        encrypted = row["rfid_enc"]
+    except (IndexError, KeyError):
+        encrypted = None
+    return dec(encrypted, row["rfid_hex"] or "")
+
+
 # --- last card the reader scanned (for the web "Scan" / enrollment button) ---
 LAST_SCAN = {"uid": None, "at": 0.0}
 
 # --- system update history shown on the System tab ---
 CHANGELOG = [
+    {"version": "1.4", "date": "2026-08-01", "items": [
+        "Security review (Dr. Pacote, via Tyler): applied the encrypt-vs-hash rule to every "
+        "stored field - hash what is only compared, encrypt what has to be read back",
+        "Security: card UIDs and user names are now encrypted at rest with Fernet "
+        "(AES-128-CBC + HMAC-SHA256); a copied cnc.db no longer hands over a list of clonable cards",
+        "Security: cards are still looked up in one indexed query via a keyed blind index, "
+        "so encryption costs nothing at the point of a tap",
+        "Security: the admin password moved from bare SHA-256 to PBKDF2 (100k rounds) - "
+        "the same weakness v1.3 fixed for PINs was still present here",
+        "Security: the admin session token is generated fresh on every start instead of "
+        "being a fixed string in the source",
+        "Security: GET /api/users now requires the admin token; it used to list every card UID "
+        "to anyone on the network",
+        "Security: /api/roster sends a hashed card ID instead of the real UID, so a stolen "
+        "reader does not leak the card list either",
+        "Encryption is an optional dependency - without `cryptography` installed the server "
+        "runs exactly as v1.3 did and says so on start"]},
     {"version": "1.3", "date": "2026-07-24", "items": [
         "Security: PINs are now stored as salted PBKDF2-HMAC-SHA256 hashes, never in plaintext "
         "(existing databases are migrated automatically on start)",
@@ -113,6 +257,8 @@ CREATE TABLE IF NOT EXISTS users (
   pin_hash TEXT,                  -- v1.3: PBKDF2-HMAC-SHA256 of the PIN
   pin_salt TEXT,                  -- v1.3: per-user random salt (hex)
   offline_hash TEXT,              -- v1.3: cheap HMAC verifier for the reader's offline cache
+  name_enc TEXT,                  -- v1.4: Fernet-encrypted name (name column blanked)
+  rfid_enc TEXT,                  -- v1.4: Fernet-encrypted card UID; rfid_hex holds the blind index
   cert_level TEXT NOT NULL DEFAULT 'none',
   status TEXT NOT NULL DEFAULT 'active',
   created_at TEXT DEFAULT (datetime('now'))
@@ -155,34 +301,88 @@ def db():
 
 
 def migrate_db(con):
-    """v1.3 migration: add pin_hash/pin_salt, hash any plaintext PINs, clear them.
+    """Bring an older database up to the current shape. Safe to re-run.
 
-    Safe to run on every start — it only acts on rows that still need it.
+    v1.3 — add pin_hash / pin_salt / offline_hash and hash any plaintext PINs.
+    v1.4 — add name_enc / rfid_enc and encrypt the name and card UID in place.
+    Both passes only touch rows that still need it, so start-up is a no-op once
+    the database is current.
     """
     cols = {r["name"] for r in con.execute("PRAGMA table_info(users)")}
-    for col in ("pin_hash", "pin_salt", "offline_hash"):
+    for col in ("pin_hash", "pin_salt", "offline_hash", "name_enc", "rfid_enc"):
         if col not in cols:
             con.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+
+    # ---- v1.3: hash any PIN still stored in the clear ----
     rows = con.execute(
-        "SELECT id, rfid_hex, pin FROM users"
+        "SELECT id, rfid_hex, rfid_enc, pin FROM users"
         " WHERE pin_hash IS NULL AND pin IS NOT NULL AND pin != ''"
     ).fetchall()
     for r in rows:
         salt = make_salt()
+        raw_card = dec(r["rfid_enc"], r["rfid_hex"] or "")
         con.execute(
             "UPDATE users SET pin_hash=?, pin_salt=?, offline_hash=?, pin='' WHERE id=?",
-            (hash_pin(r["pin"], salt), salt, offline_hash(r["rfid_hex"], r["pin"]), r["id"]))
+            (hash_pin(r["pin"], salt), salt, offline_hash(raw_card, r["pin"]), r["id"]))
     if rows:
         con.commit()
         print(f"Migrated {len(rows)} PIN(s) to salted hashes (plaintext cleared).")
 
+    # ---- v1.4: encrypt names and card UIDs ----
+    encrypted_rows = con.execute(
+        "SELECT COUNT(*) c FROM users WHERE rfid_enc IS NOT NULL").fetchone()["c"]
+
+    if not ENCRYPTION_ON:
+        if encrypted_rows and _HAVE_FERNET:
+            # A key existed once and is gone now. Starting anyway would leave every
+            # card unmatchable, so stop with an explanation instead.
+            raise SystemExit(
+                "\nThis database is encrypted but no key was found.\n"
+                "Restore secret.key next to cnc.db, or set CNC_SECRET_KEY, then start again.\n"
+                "(Refusing to continue so the encrypted rows are not damaged.)")
+        if encrypted_rows:
+            raise SystemExit(
+                "\nThis database is encrypted but the `cryptography` package is missing.\n"
+                "Run:  pip install cryptography\n")
+        if _HAVE_FERNET:
+            _use_key(_create_key())     # nothing encrypted yet: safe to start fresh
+        else:
+            return
+
+    if encrypted_rows:
+        # Confirm the key we loaded is the one this database was written with.
+        probe = con.execute(
+            "SELECT rfid_enc FROM users WHERE rfid_enc IS NOT NULL LIMIT 1").fetchone()
+        if not dec(probe["rfid_enc"], ""):
+            raise SystemExit(
+                "\nThe encryption key does not match this database.\n"
+                "secret.key (or CNC_SECRET_KEY) is from a different install.\n"
+                "(Refusing to continue so the encrypted rows are not damaged.)")
+
+    pending = con.execute(
+        "SELECT id, name, rfid_hex FROM users WHERE rfid_enc IS NULL").fetchall()
+    for r in pending:
+        raw_card = (r["rfid_hex"] or "").strip().upper()
+        con.execute(
+            "UPDATE users SET name_enc=?, rfid_enc=?, rfid_hex=?, name='' WHERE id=?",
+            (enc(r["name"]), enc(raw_card), card_id(raw_card), r["id"]))
+    if pending:
+        con.commit()
+        print(f"Encrypted {len(pending)} user record(s) at rest "
+              f"(names and card UIDs; lookups now use a blind index).")
+
 
 def seed_user(con, name, rfid, pin, level, status):
+    """Insert a user with the PIN hashed and the name / card UID encrypted."""
     salt = make_salt()
+    rfid = rfid.strip().upper()
     return con.execute(
-        "INSERT INTO users(name,rfid_hex,pin,pin_hash,pin_salt,offline_hash,cert_level,status)"
-        " VALUES(?,?,'',?,?,?,?,?)",
-        (name, rfid, hash_pin(pin, salt), salt, offline_hash(rfid, pin), level, status))
+        "INSERT INTO users(name,name_enc,rfid_hex,rfid_enc,pin,pin_hash,pin_salt,"
+        "                  offline_hash,cert_level,status)"
+        " VALUES(?,?,?,?,'',?,?,?,?,?)",
+        ("" if ENCRYPTION_ON else name, enc(name),
+         card_id(rfid), enc(rfid),
+         hash_pin(pin, salt), salt, offline_hash(rfid, pin), level, status))
 
 
 def init_db():
@@ -251,7 +451,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/health":
             # lightweight reachability check for the Pico at boot
             return self.send_json({"ok": True, "service": "CNC Access Manager",
-                                   "version": "1.3"})
+                                   "version": "1.4"})
         if path == "/api/last-scan":
             # the most recent card the reader posted (for enrollment)
             age = None
@@ -270,16 +470,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if LAST_SCAN["at"]:
                 a = round(time.time() - LAST_SCAN["at"], 1)
                 scan_age = a if a <= 3600 else None
-            return self.send_json({"ok": True, "version": "1.3", "users": users,
+            return self.send_json({"ok": True, "version": "1.4", "users": users,
                                    "active_users": active, "open_sessions": opens,
                                    "last_scan_age": scan_age, "changelog": CHANGELOG})
         if path == "/api/users":
+            # v1.4: this used to be open to anyone on the network, which meant the
+            # full card list was one curl away. It is admin-only now.
+            if not self.authed():
+                return self.send_json({"error": "unauthorized"}, 401)
             # v1.3: PINs are hashed, so the admin page can no longer display them.
+            # v1.4: names and card UIDs are decrypted here, for this page only.
             con = db()
-            rows = [dict(r) for r in con.execute(
-                "SELECT id,name,rfid_hex,cert_level,status,"
-                "       (pin_hash IS NOT NULL) AS has_pin"
-                " FROM users ORDER BY id")]
+            rows = []
+            for r in con.execute(
+                    "SELECT id,name,name_enc,rfid_hex,rfid_enc,cert_level,status,"
+                    "       (pin_hash IS NOT NULL) AS has_pin"
+                    " FROM users ORDER BY id"):
+                rows.append({"id": r["id"], "name": user_name(r),
+                             "rfid_hex": user_card(r), "cert_level": r["cert_level"],
+                             "status": r["status"], "has_pin": r["has_pin"]})
             con.close()
             return self.send_json(rows)
 
@@ -288,28 +497,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/roster":
             if not self.is_device():
                 return self.send_json({"error": "bad device key"}, 401)
+            # v1.4: the reader gets a hashed card id, not the real UID, and no
+            # names at all. roster.json on a stolen Pico is then useless as a
+            # card list. The Pico hashes the UID it just read and compares.
             con = db()
-            rows = [{"rfid_hex": r["rfid_hex"].upper(),
-                     "name": r["name"],
-                     "cert_level": r["cert_level"],
-                     "offline_hash": r["offline_hash"]}
-                    for r in con.execute(
-                        "SELECT rfid_hex,name,cert_level,offline_hash FROM users"
-                        " WHERE status='active' AND offline_hash IS NOT NULL")]
+            rows = []
+            for r in con.execute(
+                    "SELECT rfid_hex,rfid_enc,cert_level,offline_hash FROM users"
+                    " WHERE status='active' AND offline_hash IS NOT NULL"):
+                raw = user_card(r).upper()
+                rows.append({"rfid_id": hmac.new(OFFLINE_KEY, raw.encode(),
+                                                 hashlib.sha256).hexdigest(),
+                             "cert_level": r["cert_level"],
+                             "offline_hash": r["offline_hash"]})
             con.close()
             return self.send_json({"ok": True, "issued_at": now_str(), "users": rows})
         if path == "/api/logs":
             con = db()
-            access = [dict(r) for r in con.execute("""
-                SELECT a.id, COALESCE(u.name,'Deleted user') AS user,
+            access, events = [], []
+            for r in con.execute("""
+                SELECT a.id, u.name AS name, u.name_enc AS name_enc,
                        a.login_at AS login, a.logout_at AS logout
                 FROM access_logs a LEFT JOIN users u ON u.id=a.user_id
-                ORDER BY a.login_at""")]
-            events = [dict(r) for r in con.execute("""
-                SELECT e.id, COALESCE(u.name,'Deleted user') AS user,
+                ORDER BY a.login_at"""):
+                access.append({"id": r["id"], "user": user_name(r) or "Deleted user",
+                               "login": r["login"], "logout": r["logout"]})
+            for r in con.execute("""
+                SELECT e.id, u.name AS name, u.name_enc AS name_enc,
                        e.type, e.note, e.created_at AS time
                 FROM event_logs e LEFT JOIN users u ON u.id=e.user_id
-                ORDER BY e.created_at DESC""")]
+                ORDER BY e.created_at DESC"""):
+                events.append({"id": r["id"], "user": user_name(r) or "Deleted user",
+                               "type": r["type"], "note": r["note"], "time": r["time"]})
             con.close()
             return self.send_json({"access": access, "events": events})
         return self.serve_static(path)
@@ -319,7 +538,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/api/login":
             d = self.body_json()
-            supplied = hashlib.sha256((d.get("password") or "").encode()).hexdigest()
+            supplied = hashlib.pbkdf2_hmac(
+                "sha256", (d.get("password") or "").encode(), ADMIN_SALT, 100_000).hex()
             if d.get("username") == ADMIN_USER and hmac.compare_digest(supplied, ADMIN_PASS_HASH):
                 return self.send_json({"ok": True, "token": ADMIN_TOKEN})
             return self.send_json({"ok": False}, 401)
@@ -333,11 +553,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             con = db()
             try:
                 salt = make_salt()
+                raw_card = (d["rfid_hex"] or "").strip().upper()
                 cur = con.execute(
-                    "INSERT INTO users(name,rfid_hex,pin,pin_hash,pin_salt,offline_hash,"
-                    "                  cert_level,status) VALUES(?,?,'',?,?,?,?,?)",
-                    (d["name"], d["rfid_hex"], hash_pin(pin, salt), salt,
-                     offline_hash(d["rfid_hex"], pin),
+                    "INSERT INTO users(name,name_enc,rfid_hex,rfid_enc,pin,pin_hash,"
+                    "                  pin_salt,offline_hash,cert_level,status)"
+                    " VALUES(?,?,?,?,'',?,?,?,?,?)",
+                    ("" if ENCRYPTION_ON else d["name"], enc(d["name"]),
+                     card_id(raw_card), enc(raw_card),
+                     hash_pin(pin, salt), salt, offline_hash(raw_card, pin),
                      d.get("cert_level", "none"), d.get("status", "active")))
                 con.commit()
                 d["id"] = cur.lastrowid
@@ -357,8 +580,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pin  = (d.get("pin") or "").strip()
             con = db()
             row = con.execute(
-                "SELECT id,name,cert_level,pin_hash,pin_salt,status FROM users"
-                " WHERE upper(rfid_hex)=?", (rfid,)).fetchone()
+                "SELECT id,name,name_enc,cert_level,pin_hash,pin_salt,status FROM users"
+                " WHERE " + card_where(), (card_id(rfid),)).fetchone()
             ok = bool(row) and row["status"] == "active" and pin_ok(row, pin)
             if ok:
                 con.execute(
@@ -368,7 +591,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             con.close()
             if ok:
                 return self.send_json({"authorized": True,
-                                       "name": row["name"],
+                                       "name": user_name(row),
                                        "cert_level": row["cert_level"]})
             reason = ("unknown card" if not row
                       else ("disabled" if row["status"] != "active" else "bad pin"))
@@ -392,7 +615,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             d = self.body_json()
             rfid = (d.get("rfid_hex") or "").strip().upper()
             con = db()
-            row = con.execute("SELECT id FROM users WHERE upper(rfid_hex)=?", (rfid,)).fetchone()
+            row = con.execute("SELECT id FROM users WHERE " + card_where(),
+                              (card_id(rfid),)).fetchone()
             con.execute(
                 "INSERT INTO event_logs(user_id,type,note,created_at) VALUES(?,?,?,?)",
                 (row["id"] if row else None, d.get("type", "ok"), d.get("note", ""), now_str()))
@@ -409,8 +633,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             saved = 0
             for e in entries:
                 rfid = (e.get("rfid_hex") or "").strip().upper()
-                row = con.execute("SELECT id FROM users WHERE upper(rfid_hex)=?",
-                                  (rfid,)).fetchone()
+                row = con.execute("SELECT id FROM users WHERE " + card_where(),
+                                  (card_id(rfid),)).fetchone()
                 uid = row["id"] if row else None
                 when = e.get("at") or now_str()
                 kind = e.get("kind")
@@ -439,7 +663,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             d = self.body_json()
             rfid = (d.get("rfid_hex") or "").strip().upper()
             con = db()
-            row = con.execute("SELECT id FROM users WHERE upper(rfid_hex)=?", (rfid,)).fetchone()
+            row = con.execute("SELECT id FROM users WHERE " + card_where(),
+                              (card_id(rfid),)).fetchone()
             if row:
                 con.execute("""
                     UPDATE access_logs SET logout_at=?
@@ -463,9 +688,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             d = self.body_json()
             pin = str(d.get("pin", "")).strip()
             con = db()
+            raw_card = (d["rfid_hex"] or "").strip().upper()
             con.execute(
-                "UPDATE users SET name=?,rfid_hex=?,cert_level=?,status=? WHERE id=?",
-                (d["name"], d["rfid_hex"], d["cert_level"], d["status"], uid))
+                "UPDATE users SET name=?,name_enc=?,rfid_hex=?,rfid_enc=?,"
+                "                 cert_level=?,status=? WHERE id=?",
+                ("" if ENCRYPTION_ON else d["name"], enc(d["name"]),
+                 card_id(raw_card), enc(raw_card),
+                 d["cert_level"], d["status"], uid))
             # An empty PIN field means "keep the current PIN" — we cannot show the
             # old one in the form any more, because only its hash is stored.
             if pin:
@@ -475,7 +704,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 salt = make_salt()
                 con.execute(
                     "UPDATE users SET pin='', pin_hash=?, pin_salt=?, offline_hash=? WHERE id=?",
-                    (hash_pin(pin, salt), salt, offline_hash(d["rfid_hex"], pin), uid))
+                    (hash_pin(pin, salt), salt, offline_hash(raw_card, pin), uid))
             con.commit(); con.close()
             return self.send_json({"ok": True})
         self.send_error(404)
@@ -497,8 +726,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def print_security_banner():
+    if ENCRYPTION_ON:
+        print("Encryption at rest: ON  (names + card UIDs encrypted; key:",
+              os.path.basename(KEY_FILE) + ")")
+    elif not _HAVE_FERNET:
+        print("Encryption at rest: OFF - the `cryptography` package is not installed.")
+        print("  PINs and the admin password are still hashed, but card UIDs and names")
+        print("  are stored in the clear. Turn it on with:  pip install cryptography")
+    else:
+        print("Encryption at rest: OFF - no key available.")
+
+
 if __name__ == "__main__":
     init_db()
+    print_security_banner()
     # open the browser automatically ~1s after the server starts (one-click use)
     threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
     with socketserver.ThreadingTCPServer(("", PORT), Handler) as httpd:
