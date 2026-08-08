@@ -5,6 +5,11 @@ DROP TABLE IF EXISTS event_logs;
 DROP TABLE IF EXISTS access_logs;
 DROP TABLE IF EXISTS users;
 
+-- NOTE (v1.4): rfid_hex no longer holds the card number. It holds a keyed
+-- HMAC of it (a blind index) so lookups stay a single indexed query, while the
+-- recoverable copy lives encrypted in rfid_enc. Same for name / name_enc.
+-- See SECURITY.md for which field is hashed vs encrypted and why.
+--
 -- NOTE (v1.3): PINs are no longer stored in the clear. server.py creates and
 -- migrates the database itself on start, including hashing any legacy plaintext
 -- PINs, so this file is a reference for the shape of the tables. Seed rows below
@@ -17,6 +22,8 @@ CREATE TABLE users (
   pin_hash     TEXT,                              -- PBKDF2-HMAC-SHA256 (100k rounds)
   pin_salt     TEXT,                              -- per-user random salt (hex)
   offline_hash TEXT,                              -- HMAC verifier for the reader's cache
+  name_enc     TEXT,                              -- v1.4: Fernet-encrypted name (name blanked)
+  rfid_enc     TEXT,                              -- v1.4: Fernet-encrypted card UID
   cert_level   TEXT    NOT NULL DEFAULT 'none',   -- A / B / none
   status       TEXT    NOT NULL DEFAULT 'active', -- active / disabled
   created_at   TEXT    DEFAULT (datetime('now'))
