@@ -214,6 +214,14 @@ def _hmac_sha256(key, msg):
 def offline_hash(uid_hex, pin):
     return _hmac_sha256(OFFLINE_KEY, (uid_hex.upper() + ":" + pin).encode())
 
+def card_fingerprint(uid_hex):
+    """v1.4: the cached roster stores a hashed card id, never the real UID.
+
+    The server sends this same hash in /api/roster, so a stolen Pico gives up
+    a list of hashes rather than a list of clonable card numbers.
+    """
+    return _hmac_sha256(OFFLINE_KEY, uid_hex.upper().encode())
+
 def _read_json(path, default):
     try:
         with open(path, "r") as f:
@@ -265,12 +273,18 @@ def flush_queue():
         _write_json(QUEUE_FILE, queue)
 
 def check_offline(uid_hex, pin):
-    """Verify a card + PIN against the cached roster."""
+    """Verify a card + PIN against the cached roster.
+
+    v1.4: the roster holds hashed card ids, so we hash the UID we just read and
+    compare that. Names are no longer cached at all - during an outage the
+    reader does not need one, and it is one less thing to leak.
+    """
+    fingerprint = card_fingerprint(uid_hex)
     want = offline_hash(uid_hex, pin)
     for u in roster.get("users", []):
-        if u.get("rfid_hex", "").upper() == uid_hex.upper():
+        if u.get("rfid_id") == fingerprint:
             if u.get("offline_hash") == want:
-                return {"authorized": True, "name": u.get("name"),
+                return {"authorized": True, "name": "(offline)",
                         "cert_level": u.get("cert_level"), "offline": True}
             return {"authorized": False, "reason": "bad pin", "offline": True}
     return {"authorized": False, "reason": "unknown card", "offline": True}
