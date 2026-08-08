@@ -28,7 +28,8 @@ const checklistItems = [
 
 /* ---------- tiny fetch helpers ---------- */
 async function apiGet(path){
-  const r = await fetch(API + path);
+  // v1.4: GET /api/users is admin-only now, so reads carry the token as well.
+  const r = await fetch(API + path, { headers: TOKEN ? { 'X-Admin-Token': TOKEN } : {} });
   if (!r.ok) throw new Error('GET ' + path + ' failed');
   return r.json();
 }
