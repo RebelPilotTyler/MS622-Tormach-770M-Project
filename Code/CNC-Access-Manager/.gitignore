@@ -5,3 +5,6 @@ dist/
 build/
 portable/
 *.spec
+
+# v1.4: never commit the encryption key
+secret.key
