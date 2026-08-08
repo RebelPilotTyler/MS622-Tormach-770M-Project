@@ -33,7 +33,7 @@ server logs every access. Adding/removing users happens only in the web app.
 | `settings.toml` | Wi-Fi + server IP + device key + offline key + relay pin |
 | `/lib/adafruit_requests.mpy` | HTTP client |
 | `/lib/adafruit_connection_manager.mpy` | required by adafruit_requests |
-| `/lib/adafruit_hashlib.mpy` | SHA-256 for the offline PIN check |
+| `/lib/adafruit_hashlib.mpy` | SHA-256 for the offline PIN check and the card-id hash |
 | `roster.json` · `offline_queue.json` | created automatically by `code.py` |
 
 `rfid_test.py` = standalone reader test. `circup-requirements.txt` = library list.
@@ -157,6 +157,16 @@ system update history.
   the server comes back. Buffered records are capped at 100 (oldest dropped).
   Disabled users are never included in the roster, so they cannot slip in offline.
   *This is the one idea adopted from Erik's Pico W design.*
+- **Encryption at rest (v1.4).** Card UIDs and user names are encrypted in
+  `cnc.db` with Fernet, following the rule from the cybersecurity review: hash what
+  is only compared, encrypt what has to be read back. The reader is unaffected —
+  it never sees the database — but the roster it caches changed shape (below).
+  Full reasoning is in `SECURITY.md` at the top of the project.
+- **The cached roster no longer contains card numbers (v1.4).** `/api/roster` sends
+  `rfid_id`, an HMAC of the UID keyed by `OFFLINE_KEY`, plus `cert_level` and the
+  offline verifier. `code.py` hashes the UID it just read and compares that. So
+  `roster.json` on a lost Pico is a list of hashes, not a list of clonable cards.
+  Names are not cached at all any more — the reader does not need one offline.
 - **Offline security trade-off (documented on purpose).** The Pico cannot run
   100,000 PBKDF2 rounds — it would take minutes per tap. So the roster carries a
   second, cheaper verifier: one HMAC-SHA256 keyed by `OFFLINE_KEY`, a secret
@@ -174,7 +184,7 @@ system update history.
 |--------|------|------|------|---------|
 | GET  | `/api/health` | none | — | reachability check |
 | POST | `/api/verify` | `X-Device-Key` | `{rfid_hex, pin}` | check card+PIN, log access |
-| GET  | `/api/roster` | `X-Device-Key` | — | **v1.3** authorized list for the offline cache (hashes only) |
+| GET  | `/api/roster` | `X-Device-Key` | — | **v1.3** authorized list for the offline cache. **v1.4:** sends a hashed card id (`rfid_id`), never the real UID, and no names |
 | POST | `/api/sync`   | `X-Device-Key` | `{entries:[…]}` | **v1.3** upload records buffered while offline |
 | POST | `/api/logout` | device/admin | `{rfid_hex}` | close the open session |
 | POST | `/api/event`  | device/admin | `{rfid_hex, type, note}` | log crash/dull-bit/etc. |
@@ -184,7 +194,9 @@ system update history.
 **PINs are never returned by any endpoint.** `GET /api/users` reports only
 `has_pin: true/false`, and `/api/roster` carries hashes. Since v1.3 the admin page
 cannot display an existing PIN — editing a user and leaving the PIN field blank
-keeps the current one; typing a new one replaces it.
+keeps the current one; typing a new one replaces it. Since **v1.4** `GET /api/users`
+also requires the admin token; it used to hand the whole card list to anyone on
+the network.
 
 Quick test without hardware (server running):
 ```
@@ -201,9 +213,11 @@ curl -X POST http://localhost:8000/api/verify ^
 - **Find the server without a fixed IP:** run the server with an mDNS name so the
   Pico can reach `http://cnc-lab.local:8000` instead of a hard-coded IP.
 - **Security hardening:** ~~hash PINs on the server~~ **done in v1.3** (salted
-  PBKDF2-HMAC-SHA256, 100k rounds). Still to do: move the API to HTTPS on the lab
+  PBKDF2-HMAC-SHA256, 100k rounds). ~~encrypt card UIDs and names at rest~~
+  **done in v1.4** (Fernet + blind index), along with PBKDF2 for the admin password
+  and admin-only `GET /api/users`. Still to do: move the API to HTTPS on the lab
   network, and rotate `DEVICE_KEY` / `OFFLINE_KEY` away from the defaults.
-  (Dr. Pacote's cyber audit — noted in the stand-up — fits here.)
+  (Both are from Dr. Pacote's review — see `SECURITY.md`.)
 - **On-machine event entry:** add an LCD + rotary encoder, or let students log a
   crash from the desktop, posting to `/api/event`; optionally email a push
   notification to the instructor when an event is logged.
